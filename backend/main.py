@@ -21,7 +21,11 @@ class VoiceAssistantApp:
         self.tts = TTSHandler()
         self.audio = AudioHandler(on_error=self._on_audio_error, is_output_locked=self.tts.is_output_locked)
         self.llm = LLMAgent()
-        self.windows = WindowManager()
+        try:
+            self.windows = WindowManager()
+        except Exception as exc:
+            self.windows = None
+            self.tts.speak_error(f"창 제어 기능 비활성화: {exc}")
         self.ws_bridge = WebSocketBridge()
 
         self.mode = AssistantMode.NORMAL_MODE
@@ -75,6 +79,9 @@ class VoiceAssistantApp:
         kind = action.get("action", "none")
 
         if kind == "move_edge_window":
+            if self.windows is None:
+                self.tts.speak("창 제어 기능이 비활성화되어 있습니다.", lang="ko")
+                return
             target = action.get("target", "left")
             msg = self.windows.move_and_fullscreen(target)
             self.tts.speak(msg, lang="ko")
@@ -82,12 +89,12 @@ class VoiceAssistantApp:
 
         if kind == "youtube_control":
             payload = {
-                "action": action.get("action_name") or action.get("youtube_action") or action.get("sub_action") or action.get("action"),
+                "action": action.get("action_name") or action.get("youtube_action") or action.get("sub_action"),
                 "query": action.get("query"),
                 "seconds": action.get("seconds"),
             }
-            if payload["action"] == "youtube_control":
-                payload["action"] = action.get("youtube_action", "play")
+            if not payload["action"]:
+                payload["action"] = "play"
             await self.ws_bridge.broadcast(payload)
             self.tts.speak("유튜브 명령을 전달했습니다.", lang="ko")
             return
