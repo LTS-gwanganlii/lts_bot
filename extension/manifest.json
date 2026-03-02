@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "LTS YouTube Controller",
+  "version": "1.0.0",
+  "permissions": ["tabs", "scripting", "activeTab"],
+  "host_permissions": ["*://*.youtube.com/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
