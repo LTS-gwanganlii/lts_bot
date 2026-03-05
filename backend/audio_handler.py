@@ -90,7 +90,8 @@ class AudioHandler:
         self.silence_threshold = silence_threshold
         self.gate_threshold = gate_threshold if gate_threshold is not None else self._env_float("AUDIO_GATE_THRESHOLD", 500.0)
         self.gate_min_duration_sec = gate_min_duration_sec if gate_min_duration_sec is not None else self._env_float("AUDIO_GATE_MIN_DURATION_SEC", 0.4)
-        # STT 대기 중에도 캡처 스레드는 계속 put → 큐가 작으면 다음 발화 앞부분이 짤림. 500프레임 ≈ 15초분.
+        # STT 대기 중에는 캡처 큐에 넣지 않음 (큐 폭발 방지). _stt_busy.set() 시 캡처는 put 스킵.
+        self._stt_busy = threading.Event()
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -140,6 +141,8 @@ class AudioHandler:
             try:
                 frame = stream.read(self.frame_size, exception_on_overflow=False)
                 if self.is_output_locked():
+                    continue
+                if self._stt_busy.is_set():
                     continue
                 self._audio_queue.put_nowait(frame)
             except queue.Full:
@@ -210,7 +213,11 @@ class AudioHandler:
                         if self.on_gemini_invoked:
                             self.on_gemini_invoked()
                         logger.info("AI(STT) 호출 시작 (%.0f bytes)", len(audio_bytes))
-                        text = await self.session_manager.transcribe(audio_bytes)
+                        self._stt_busy.set()
+                        try:
+                            text = await self.session_manager.transcribe(audio_bytes)
+                        finally:
+                            self._stt_busy.clear()
                         after_q = self._audio_queue.qsize()
                         if after_q >= 400:
                             logger.warning("STT 반환 후 큐 깊이=%d (거의 가득 — 다음 발화 앞부분 짤림 가능)", after_q)

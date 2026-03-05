@@ -119,7 +119,7 @@ class LiveSessionManager:
         self._session_cm = None
         self._receive_task: Optional[asyncio.Task] = None
         self._resumption_handle: Optional[str] = None
-        # turn_complete마다 그 턴의 전사 결과를 넣는 큐 (str, 빈 문자열 포함)
+        # 전사 스트리밍: 전사 업데이트마다 put (turn_complete 의존 안 함). transcribe()는 첫 이벤트 + 0.8s idle로 확정.
         self._transcript_queue: asyncio.Queue[str] = asyncio.Queue()
         self._lock = asyncio.Lock()
         self._closed = False
@@ -147,149 +147,160 @@ class LiveSessionManager:
         if session is None:
             return
 
-        # 현재 턴에서 누적된 전사 텍스트
         turn_texts: list[str] = []
         _msg_count = 0
 
-        def _flush_turn():
+        def _put_transcript(text: str) -> None:
+            """전사 스트리밍: 업데이트마다 큐에 넣음 (turn_complete 의존 안 함)."""
+            if text:
+                self._transcript_queue.put_nowait(text)
+                logger.debug("[Live] 전사 업데이트: %s", text[:60] + ("..." if len(text) > 60 else ""))
+
+        def _on_turn_complete():
             result = " ".join(turn_texts).strip()
             turn_texts.clear()
-            logger.info("[Live RAW] _flush_turn → transcript_queue.put_nowait(%r)", result[:100] + ("..." if len(result) > 100 else ""))
-            self._transcript_queue.put_nowait(result)
-            logger.info("전사 턴 완료: %s", result[:80] + ("..." if len(result) > 80 else "") if result else "(없음)")
+            logger.info("[Live RAW] turn_complete → 턴 종료 (로그만, 큐는 스트리밍으로 이미 반영): %s", result[:80] if result else "(없음)")
 
-        logger.info("[Live RAW] receive_loop 시작, session.receive() 대기 중...")
+        logger.info("[Live RAW] receive_loop 시작 (턴 끝나면 receive() 재호출)...")
         try:
-            async for msg in session.receive():
-                if self._closed:
-                    break
-                _msg_count += 1
-                # RAW: 수신된 메시지 전체 로깅 — transcript 외 activity_end, usage_metadata, AUDIO 등 누락 방지
-                attrs = [x for x in dir(msg) if not x.startswith("_")]
-                logger.info(
-                    "[Live RAW] msg #%d 수신 | type=%s | attrs=%s",
-                    _msg_count,
-                    type(msg).__name__,
-                    attrs,
-                )
-                logger.info("[Live RAW] msg 전체 필드 요약: %s", _msg_summary(msg))
-                logger.info("[Live RAW] msg dump: %s", _raw_dump(msg))
-                if hasattr(msg, "model_dump"):
-                    try:
-                        wire = msg.model_dump(mode="json")
-                        # 바이너리/긴 값은 길이만
-                        def _wire_summary(d, depth=0):
-                            if depth > 2:
-                                return "..."
-                            if isinstance(d, dict):
-                                return {k: _wire_summary(v, depth + 1) for k, v in list(d.items())[:12]}
-                            if isinstance(d, (bytes, bytearray)):
-                                return f"<bytes len={len(d)}>"
-                            if isinstance(d, str) and len(d) > 80:
-                                return d[:80] + "..."
-                            return d
-                        logger.info("[Live RAW] msg.model_dump (와이어 포맷 키): %s", list(wire.keys()) if isinstance(wire, dict) else type(wire).__name__)
-                        logger.info("[Live RAW] msg.model_dump 요약: %s", _raw_dump(_wire_summary(wire)))
-                    except Exception as e:
-                        logger.info("[Live RAW] msg.model_dump 실패: %s", e)
+            while not self._closed and session is self._session:
+                async for msg in session.receive():
+                    if self._closed:
+                        break
+                        _msg_count += 1
+                        # RAW: 수신된 메시지 전체 로깅 — transcript 외 activity_end, usage_metadata, AUDIO 등 누락 방지
+                        attrs = [x for x in dir(msg) if not x.startswith("_")]
+                        logger.info(
+                        "[Live RAW] msg #%d 수신 | type=%s | attrs=%s",
+                        _msg_count,
+                        type(msg).__name__,
+                        attrs,
+                        )
+                        logger.info("[Live RAW] msg 전체 필드 요약: %s", _msg_summary(msg))
+                        logger.info("[Live RAW] msg dump: %s", _raw_dump(msg))
+                        if hasattr(msg, "model_dump"):
+                            try:
+                                wire = msg.model_dump(mode="json")
+                                # 바이너리/긴 값은 길이만
+                                def _wire_summary(d, depth=0):
+                                    if depth > 2:
+                                        return "..."
+                                    if isinstance(d, dict):
+                                        return {k: _wire_summary(v, depth + 1) for k, v in list(d.items())[:12]}
+                                    if isinstance(d, (bytes, bytearray)):
+                                        return f"<bytes len={len(d)}>"
+                                    if isinstance(d, str) and len(d) > 80:
+                                        return d[:80] + "..."
+                                    return d
+                                logger.info("[Live RAW] msg.model_dump (와이어 포맷 키): %s", list(wire.keys()) if isinstance(wire, dict) else type(wire).__name__)
+                                logger.info("[Live RAW] msg.model_dump 요약: %s", _raw_dump(_wire_summary(wire)))
+                            except Exception as e:
+                                logger.info("[Live RAW] msg.model_dump 실패: %s", e)
 
-                # 문서상 서버 메시지 타입: ServerContent, ToolCall, ActivityEnd, GoAway, usageMetadata 등
-                for wire_name in ("activity_end", "activityEnd", "usage_metadata", "usageMetadata", "go_away", "goAway"):
-                    v = getattr(msg, wire_name, None)
-                    if v is not None:
-                        logger.info("[Live RAW] msg.%s = %s", wire_name, _raw_dump(v))
+                    # 문서상 서버 메시지 타입: ServerContent, ToolCall, ActivityEnd, GoAway, usageMetadata 등
+                    for wire_name in ("activity_end", "activityEnd", "usage_metadata", "usageMetadata", "go_away", "goAway"):
+                        v = getattr(msg, wire_name, None)
+                        if v is not None:
+                            logger.info("[Live RAW] msg.%s = %s", wire_name, _raw_dump(v))
 
-                sc = getattr(msg, "server_content", None) or getattr(msg, "serverContent", None)
-                if sc is not None:
-                    logger.info(
-                        "[Live RAW] server_content 있음 | sc.type=%s | sc.dump: %s",
-                        type(sc).__name__,
-                        _raw_dump(sc),
-                    )
-                    logger.info(
-                        "[Live RAW] server_content turn_complete=%s, turnComplete=%s",
-                        getattr(sc, "turn_complete", "<없음>"),
-                        getattr(sc, "turnComplete", "<없음>"),
-                    )
-                    # AUDIO/바이너리 파트: parts, inline_data 등
-                    for part_attr in ("parts", "model_turn", "modelTurn"):
-                        p = getattr(sc, part_attr, None)
-                        if p is None:
-                            continue
-                        if hasattr(p, "__iter__") and not isinstance(p, (str, bytes)):
-                            for i, part in enumerate(list(p)[:5]):
-                                pd = _raw_dump(part)
-                                if "bytes" in pd or "data" in pd:
-                                    logger.info("[Live RAW] server_content.%s[%d] (바이너리/파트): %s", part_attr, i, pd)
+                    sc = getattr(msg, "server_content", None) or getattr(msg, "serverContent", None)
+                    if sc is not None:
+                        logger.info(
+                            "[Live RAW] server_content 있음 | sc.type=%s | sc.dump: %s",
+                            type(sc).__name__,
+                            _raw_dump(sc),
+                        )
+                        logger.info(
+                            "[Live RAW] server_content turn_complete=%s, turnComplete=%s",
+                            getattr(sc, "turn_complete", "<없음>"),
+                            getattr(sc, "turnComplete", "<없음>"),
+                        )
+                        # AUDIO/바이너리 파트: parts, inline_data 등
+                        for part_attr in ("parts", "model_turn", "modelTurn"):
+                            p = getattr(sc, part_attr, None)
+                            if p is None:
+                                continue
+                            if hasattr(p, "__iter__") and not isinstance(p, (str, bytes)):
+                                for i, part in enumerate(list(p)[:5]):
+                                    pd = _raw_dump(part)
+                                    if "bytes" in pd or "data" in pd:
+                                        logger.info("[Live RAW] server_content.%s[%d] (바이너리/파트): %s", part_attr, i, pd)
 
-                # ── Session resumption ──────────────────────────────────────
-                su = getattr(msg, "session_resumption_update", None)
-                if su:
-                    resumable = getattr(su, "resumable", False)
-                    new_handle = getattr(su, "new_handle", None)
-                    if resumable and new_handle:
-                        self._resumption_handle = new_handle
-                        logger.debug("Resumption handle updated")
-                    else:
-                        self._resumption_handle = None
+                    # ── Session resumption ──────────────────────────────────────
+                    su = getattr(msg, "session_resumption_update", None)
+                    if su:
+                        resumable = getattr(su, "resumable", False)
+                        new_handle = getattr(su, "new_handle", None)
+                        if resumable and new_handle:
+                            self._resumption_handle = new_handle
+                            logger.debug("Resumption handle updated")
+                        else:
+                            self._resumption_handle = None
 
-                # ── 전사 텍스트 수집 ────────────────────────────────────────
-                sc = getattr(msg, "server_content", None)
-                if sc:
-                    # input_audio_transcription / input_transcription: 사용자 음성 전사 (STT 핵심)
-                    # 문서: https://ai.google.dev/gemini-api/docs/live
-                    for attr in ("input_audio_transcription", "inputAudioTranscription", "input_transcription"):
-                        t = _extract_text(getattr(sc, attr, None))
-                        if t:
-                            logger.debug("input_audio_transcription: %s", t)
-                            turn_texts.append(t)
-                            break
-
-                    # output_transcription: 모델 음성 전사 (텍스트가 없을 때 보조)
-                    if not turn_texts:
-                        for attr in ("output_transcription", "outputTranscription"):
+                    # ── 전사 텍스트 수집 ────────────────────────────────────────
+                    sc = getattr(msg, "server_content", None)
+                    if sc:
+                        # input_audio_transcription / input_transcription: 사용자 음성 전사 (STT 핵심)
+                        # 문서: https://ai.google.dev/gemini-api/docs/live
+                        for attr in ("input_audio_transcription", "inputAudioTranscription", "input_transcription"):
                             t = _extract_text(getattr(sc, attr, None))
                             if t:
-                                logger.debug("output_transcription: %s", t)
+                                logger.debug("input_audio_transcription: %s", t)
                                 turn_texts.append(t)
+                                _put_transcript(t)
                                 break
 
-                    # model_turn.parts[].text (TEXT 모달리티 응답 혹은 일부 SDK 버전)
-                    if not turn_texts:
-                        model_turn = getattr(sc, "model_turn", None)
-                        if model_turn:
-                            for part in getattr(model_turn, "parts", None) or []:
-                                t = getattr(part, "text", None)
+                        # output_transcription: 모델 음성 전사 (텍스트가 없을 때 보조)
+                        if not turn_texts:
+                            for attr in ("output_transcription", "outputTranscription"):
+                                t = _extract_text(getattr(sc, attr, None))
                                 if t:
-                                    logger.debug("model_turn.part.text: %s", t)
+                                    logger.debug("output_transcription: %s", t)
                                     turn_texts.append(t)
+                                    _put_transcript(t)
+                                    break
 
-                    # turn_complete / turnComplete → 큐에 넣기 (텍스트 없어도 빈 문자열로 신호)
-                    turn_done = getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False)
-                    if turn_done:
-                        logger.info("[Live RAW] turn_complete=True 감지 → _flush_turn() 호출")
-                        _flush_turn()
-                        continue
+                        # model_turn.parts[].text (TEXT 모달리티 응답 혹은 일부 SDK 버전)
+                        if not turn_texts:
+                            model_turn = getattr(sc, "model_turn", None)
+                            if model_turn:
+                                for part in getattr(model_turn, "parts", None) or []:
+                                    t = getattr(part, "text", None)
+                                    if t:
+                                        logger.debug("model_turn.part.text: %s", t)
+                                        turn_texts.append(t)
+                                        _put_transcript(t)
 
-                    # 서버 오류 메시지 감지
-                    raw_text = _extract_text(getattr(sc, "text", None)) or _extract_text(getattr(msg, "text", None))
-                    if raw_text:
-                        low = raw_text.lower()
+                        # turn_complete 시 스트림 종료(이 for 끝남). 다음 턴은 바깥 while에서 receive() 재호출.
+                        turn_done = getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False)
+                        if turn_done:
+                            logger.info("[Live RAW] turn_complete=True 감지 → 턴 종료")
+                            _on_turn_complete()
+                            continue
+
+                        # 서버 오류 메시지 감지
+                        raw_text = _extract_text(getattr(sc, "text", None)) or _extract_text(getattr(msg, "text", None))
+                        if raw_text:
+                            low = raw_text.lower()
+                            if "non-audio" in low or "cannot extract voices" in low:
+                                self._on_error(raw_text)
+                                self._transcript_queue.put_nowait("")  # 대기 중인 transcribe() 해제
+                                _on_turn_complete()
+                            elif raw_text not in turn_texts:
+                                turn_texts.append(raw_text)
+                                _put_transcript(raw_text)
+
+                    # 메시지 최상위 text (일부 SDK 버전)
+                    top_text = _extract_text(getattr(msg, "text", None))
+                    if top_text and top_text not in turn_texts:
+                        low = top_text.lower()
                         if "non-audio" in low or "cannot extract voices" in low:
-                            self._on_error(raw_text)
-                            _flush_turn()  # 빈 문자열로 신호
-                        elif raw_text not in turn_texts:
-                            turn_texts.append(raw_text)
-
-                # 메시지 최상위 text (일부 SDK 버전)
-                top_text = _extract_text(getattr(msg, "text", None))
-                if top_text and top_text not in turn_texts:
-                    low = top_text.lower()
-                    if "non-audio" in low or "cannot extract voices" in low:
-                        self._on_error(top_text)
-                        _flush_turn()
-                    else:
-                        turn_texts.append(top_text)
+                            self._on_error(top_text)
+                            self._transcript_queue.put_nowait("")
+                            _on_turn_complete()
+                        else:
+                            turn_texts.append(top_text)
+                            _put_transcript(top_text)
 
         except asyncio.CancelledError:
             pass
@@ -308,10 +319,14 @@ class LiveSessionManager:
             client = self._get_client()
             # native-audio 모델은 TEXT 미지원(→ 1007). AUDIO만 사용.
             # input_audio_transcription: 사용자 음성 전사 요청.
+            # 서버 VAD 끄고 클라이언트가 activity_start/activity_end로 턴 경계 명시.
             config_dict: dict = {
                 "response_modalities": ["AUDIO"],
                 "output_audio_transcription": {},
                 "input_audio_transcription": {},
+                "realtime_input_config": {
+                    "automatic_activity_detection": {"disabled": True},
+                },
             }
             if self._resumption_handle:
                 config_dict["session_resumption"] = {"handle": self._resumption_handle}
@@ -359,7 +374,7 @@ class LiveSessionManager:
             self._session = None
 
     async def transcribe(self, audio_bytes: bytes) -> str:
-        """Send audio to Live session and wait for turn_complete transcript."""
+        """Send audio with activity_start/activity_end 경계, 전사는 스트리밍 수신 후 첫 이벤트 + 0.8s idle로 확정."""
         if not audio_bytes or len(audio_bytes) < MIN_AUDIO_BYTES:
             return ""
         if self._session is None:
@@ -377,13 +392,52 @@ class LiveSessionManager:
             session = self._session
         if session is None:
             return ""
+
+        # 이번 턴에 해당하지 않는 이전 전사 제거
+        while True:
+            try:
+                self._transcript_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
         import time as _time
         send_start = _time.perf_counter()
         total_bytes = len(audio_bytes)
         logger.info("[Live RAW] 오디오 전송 시작: %d bytes (%.2fs), mime=%s", total_bytes, total_bytes / 32000.0, AUDIO_PCM_MIME)
 
         try:
-            # 문서 권장: 20~40ms 청크로 스트리밍. 한 번에 한 blob만 보내면 잘리거나 서버 처리 이슈 가능.
+            # 턴 경계: activity_start → 오디오 → activity_end (서버 VAD 끄고 클라이언트가 경계 명시)
+            async def _send_activity_start() -> None:
+                send_fn = getattr(session, "send_realtime_input", None)
+                if not send_fn:
+                    return
+                try:
+                    try:
+                        from google.genai.types import ActivityStart
+                        await send_fn(activity_start=ActivityStart())
+                    except (ImportError, AttributeError, TypeError):
+                        await send_fn(activity_start=True)
+                    logger.info("[Live RAW] activity_start 전송 완료")
+                except (TypeError, ValueError, AttributeError) as e:
+                    logger.debug("[Live RAW] activity_start 미지원(무시): %s", e)
+
+            async def _send_activity_end() -> None:
+                send_fn = getattr(session, "send_realtime_input", None)
+                if not send_fn:
+                    return
+                try:
+                    try:
+                        from google.genai.types import ActivityEnd
+                        await send_fn(activity_end=ActivityEnd())
+                    except (ImportError, AttributeError, TypeError):
+                        await send_fn(activity_end=True)
+                    logger.info("[Live RAW] activity_end 전송 완료 (총 경과 %.3fs)", _time.perf_counter() - send_start)
+                except (TypeError, ValueError, AttributeError) as e:
+                    logger.debug("[Live RAW] activity_end 미지원(무시): %s", e)
+
+            await _send_activity_start()
+
+            # 문서 권장: 20~40ms 청크로 스트리밍
             chunks = []
             for i in range(0, total_bytes, CHUNK_BYTES):
                 chunk = audio_bytes[i : i + CHUNK_BYTES]
@@ -410,10 +464,10 @@ class LiveSessionManager:
             except (TypeError, ValueError) as e:
                 logger.info("[Live RAW] audio_stream_end 미지원 또는 오류 (무시): %s", e)
 
-            # send_client_content(turn_complete=True)만 보내면 1007 Invalid argument 발생 가능(빈 ClientContent).
-            # 턴 종료는 audio_stream_end로만 신호하고, clientContent는 사용하지 않음.
+            # 턴 종료: activity_end (스트림 끝을 서버에 명시)
+            await _send_activity_end()
 
-            logger.info("[Live RAW] 전송 끝. transcript_queue.get() 대기 (timeout=30s)...")
+            logger.info("[Live RAW] 전송 끝. 전사 스트리밍 대기 (첫 이벤트 + 0.8s idle)...")
         except AttributeError as e:
             logger.info("[Live RAW] send_realtime_input 없음, send() 폴백 (한 번에 전송): %s", e)
             try:
@@ -433,14 +487,25 @@ class LiveSessionManager:
                         pass
                     self._session_cm = None
             return ""
+        # 전사 스트리밍: 첫 이벤트까지 30s 대기, 이후 0.8s idle이면 최종값 확정 반환
         try:
-            text = await asyncio.wait_for(self._transcript_queue.get(), timeout=30.0)
-            logger.info("[Live RAW] transcript_queue.get() 수신: len=%d", len(text))
-            logger.info("전사 결과: %s", text[:80] + "..." if len(text) > 80 else text)
-            return text
+            first = await asyncio.wait_for(self._transcript_queue.get(), timeout=30.0)
+            last_text = first.strip()
+            idle_sec = 0.8
+            deadline = _time.perf_counter() + idle_sec
+            while _time.perf_counter() < deadline:
+                try:
+                    more = self._transcript_queue.get_nowait()
+                    last_text = (more or "").strip() or last_text
+                    deadline = _time.perf_counter() + idle_sec
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.05)
+            logger.info("[Live RAW] 전사 확정 (0.8s idle): len=%d", len(last_text))
+            logger.info("전사 결과: %s", last_text[:80] + "..." if len(last_text) > 80 else last_text)
+            return last_text
         except asyncio.TimeoutError:
-            logger.warning("[Live RAW] transcript_queue.get() 타임아웃(30s) — 서버에서 turn_complete 미수신 또는 메시지 없음")
-            self._on_error("Live 전사 응답 시간 초과 (turn_complete 미수신)")
+            logger.warning("[Live RAW] 첫 전사 이벤트 30s 타임아웃")
+            self._on_error("Live 전사 응답 시간 초과")
             return ""
         except Exception as e:
             self._on_error(f"Live 전사 수신 실패: {e}")
