@@ -55,7 +55,7 @@ pip install -r requirements.txt
     pip install git+https://github.com/myshell-ai/MeloTTS.git
     python -m unidic download
     ```
-  MeloTTS 모델은 `backend/models/melo` 등 코드에서 지정한 경로에 두면 됩니다.
+  최신 MeloTTS는 `model-path` 파라미터를 지원하지 않으며, 기본적으로 Hugging Face에서 언어별 모델을 자동 다운로드합니다. 로컬 모델을 쓰려면 `config.json`과 `checkpoint.pth`를 한 디렉터리(예: `backend/models/melo`)에 두고 `TTSHandler(model_dir="backend/models/melo")`로 지정하면 됩니다.
   - **tokenizers / llvmlite 빌드 실패 시** (Rust 오류, `dry_run` 오류): pip와 setuptools를 올린 뒤, 미리 빌드된 wheel로 의존성을 먼저 설치하고 MeloTTS를 다시 시도하세요.
     ```bash
     pip install --upgrade pip setuptools wheel

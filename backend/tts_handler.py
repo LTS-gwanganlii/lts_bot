@@ -15,7 +15,7 @@ class TTSHandler:
         "ru": "RU",
     }
 
-    def __init__(self, model_dir: str = "./models/melo") -> None:
+    def __init__(self, model_dir: Optional[str] = None) -> None:
         self._lock = threading.RLock()
         self._is_speaking = threading.Event()
 
@@ -25,7 +25,8 @@ class TTSHandler:
             raise RuntimeError(f"MeloTTS 로드 실패: {exc}") from exc
 
         self._tts_cls = TTS
-        self.model_dir = Path(model_dir)
+        # 최신 MeloTTS는 model_path 미지원. HF에서 자동 다운로드 또는 config_path/ckpt_path 사용.
+        self._model_dir = Path(model_dir) if model_dir else None
         self._engines: dict[str, object] = {}
 
     def is_output_locked(self) -> bool:
@@ -34,7 +35,17 @@ class TTSHandler:
     def _get_engine(self, lang: str):
         lang = lang if lang in self.VOICE_BY_LANG else "ko"
         if lang not in self._engines:
-            self._engines[lang] = self._tts_cls(language=lang, model_path=str(self.model_dir))
+            voice = self.VOICE_BY_LANG[lang]  # MeloTTS 언어 코드: KR, EN, ZH, RU
+            if self._model_dir and (self._model_dir / "config.json").exists() and (self._model_dir / "checkpoint.pth").exists():
+                self._engines[lang] = self._tts_cls(
+                    language=voice,
+                    device="auto",
+                    use_hf=False,
+                    config_path=str(self._model_dir / "config.json"),
+                    ckpt_path=str(self._model_dir / "checkpoint.pth"),
+                )
+            else:
+                self._engines[lang] = self._tts_cls(language=voice, device="auto")
         return self._engines[lang]
 
     def speak(self, text: str, lang: str = "ko") -> None:
