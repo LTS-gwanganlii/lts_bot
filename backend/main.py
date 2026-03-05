@@ -38,9 +38,9 @@ class VoiceAssistantApp:
         self.llm = LLMAgent()
         try:
             self.windows = WindowManager()
-        except Exception as exc:
+        except Exception:
             self.windows = None
-            self.tts.speak_error(f"창 제어 기능 비활성화: {exc}")
+            play_sound("error.mp3")
         self.ws_bridge = WebSocketBridge()
 
         self.mode = AssistantMode.NORMAL_MODE
@@ -49,7 +49,6 @@ class VoiceAssistantApp:
 
     def _on_audio_error(self, text: str) -> None:
         play_sound("error.mp3")
-        self.tts.speak_error(text)
 
     async def _run_loop(self) -> None:
         await self.ws_bridge.start()
@@ -83,9 +82,8 @@ class VoiceAssistantApp:
                 # 게이트 통과한 발화는 모두 명령으로 처리 (OK 홍걸 웨이크 게이트 없음)
                 action = self.llm.plan_action(result.text)
                 await self._execute_action(action)
-            except Exception as exc:
+            except Exception:
                 play_sound("error.mp3")
-                self.tts.speak_error(str(exc))
 
         self.audio.stop()
         await self.live_session.close()

@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 # Model and config (Live API native audio model)
 LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 AUDIO_PCM_MIME = "audio/pcm;rate=16000"
+# 16 kHz, 16-bit mono: 32000 bytes/sec. 최소 100ms 미만은 non-audio 오류 유발 가능.
+MIN_AUDIO_BYTES = 3200
 
 
 class LiveSessionManager:
@@ -69,22 +71,29 @@ class LiveSessionManager:
                     else:
                         # This segment not resumable or no handle
                         self._resumption_handle = None
-                # Transcript: server content often has model_turn or input transcript
+                # Transcript: native-audio 모델은 response_modalities=AUDIO 사용 시 전사는 output_transcription 등으로 옴
                 text = None
                 if hasattr(msg, "server_content") and msg.server_content:
                     sc = msg.server_content
-                    if hasattr(sc, "model_turn") and sc.model_turn and hasattr(sc.model_turn, "parts"):
+                    # AUDIO 모드 전사 (output_transcription / input_audio_transcription)
+                    text = getattr(sc, "output_transcription", None) or getattr(sc, "outputTranscription", None)
+                    if text is None:
+                        text = getattr(sc, "input_audio_transcription", None) or getattr(sc, "inputAudioTranscription", None)
+                    if text is None and hasattr(sc, "model_turn") and sc.model_turn and hasattr(sc.model_turn, "parts"):
                         for part in sc.model_turn.parts or []:
                             if getattr(part, "text", None):
                                 text = part.text
                                 break
-                    if text is None and hasattr(sc, "interrupted") and hasattr(sc, "turn_complete"):
-                        pass
-                    # Also check for transcript in other shapes (input transcript)
                     if text is None and hasattr(msg, "text"):
                         text = msg.text
                 if text is not None and isinstance(text, str) and text.strip():
-                    self._transcript_queue.put_nowait(text.strip())
+                    t = text.strip()
+                    # 서버가 오류 메시지를 텍스트로 보낼 수 있음 (e.g. "Cannot extract voices from a non-audio request")
+                    if "non-audio" in t.lower() or "cannot extract voices" in t.lower():
+                        self._on_error(t)
+                        self._transcript_queue.put_nowait("")
+                    else:
+                        self._transcript_queue.put_nowait(t)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -100,19 +109,22 @@ class LiveSessionManager:
             if self._session is not None:
                 return True
             client = self._get_client()
+            # native-audio 모델은 response_modalities에 TEXT 미지원 → 1007 발생. AUDIO만 사용.
+            # 전사는 server_content.output_transcription 에서 수신 (output_audio_transcription 설정 시).
+            config_dict: dict = {"response_modalities": ["AUDIO"], "output_audio_transcription": {}}
+            if self._resumption_handle:
+                config_dict["session_resumption"] = {"handle": self._resumption_handle}
             try:
                 from google.genai import types  # type: ignore
                 if self._resumption_handle:
                     config = types.LiveConnectConfig(
-                        response_modalities=["TEXT"],
+                        response_modalities=["AUDIO"],
                         session_resumption=types.SessionResumptionConfig(handle=self._resumption_handle),
                     )
                 else:
-                    config = types.LiveConnectConfig(response_modalities=["TEXT"])
+                    config = types.LiveConnectConfig(response_modalities=["AUDIO"])
             except Exception:
-                config = {"response_modalities": ["TEXT"]}
-                if self._resumption_handle:
-                    config["session_resumption"] = {"handle": self._resumption_handle}
+                config = config_dict
             try:
                 self._session_cm = client.aio.live.connect(
                     model=LIVE_MODEL,
@@ -126,7 +138,16 @@ class LiveSessionManager:
                 self._resumption_handle = None
                 self._session_cm = None
                 self._session = None
-                return False
+                # 1007(잘못된 인자) 등 실패 시 재시도 1회(세션 재개 없이)
+                try:
+                    await asyncio.sleep(0.5)
+                    config_retry = config_dict
+                    self._session_cm = client.aio.live.connect(model=LIVE_MODEL, config=config_retry)
+                    self._session = await self._session_cm.__aenter__()
+                    self._receive_task = asyncio.create_task(self._receive_loop())
+                    return True
+                except Exception:
+                    return False
 
     async def close(self) -> None:
         """Close session and receive task."""
@@ -147,7 +168,7 @@ class LiveSessionManager:
 
     async def transcribe(self, audio_bytes: bytes) -> str:
         """Send audio to Live session and wait for one transcript. Uses lock so only one send at a time."""
-        if not audio_bytes:
+        if not audio_bytes or len(audio_bytes) < MIN_AUDIO_BYTES:
             return ""
         if self._session is None:
             ok = await self.ensure_connected()

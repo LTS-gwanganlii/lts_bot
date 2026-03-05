@@ -52,30 +52,35 @@ class TTSHandler:
         if not text.strip():
             return
         with self._lock:
+            if self._is_speaking.is_set():
+                return
             self._is_speaking.set()
-            try:
-                engine = self._get_engine(lang)
-                # MeloTTS: hps.data.spk2id는 HParams 객체(중첩 dict가 HParams로 로드됨). .get() 대신 getattr 사용.
-                hps = getattr(engine, "hps", None)
-                data = getattr(hps, "data", None) if hps else None
-                spk2id = getattr(data, "spk2id", None) if data else None
-                voice = self.VOICE_BY_LANG.get(lang, "KR")
-                if spk2id is not None:
-                    speaker_id = getattr(spk2id, voice, None)
-                    if speaker_id is None:
-                        speaker_id = next(iter(spk2id.values()), 0)
-                else:
-                    speaker_id = 0
-                engine.tts_to_file(text=text, speaker_id=speaker_id, output_path="_tmp_tts.wav")
-                # simple playback using sounddevice + soundfile
-                import sounddevice as sd  # type: ignore
-                import soundfile as sf  # type: ignore
+            threading.Thread(target=self._speak_worker, args=(text, lang), daemon=True).start()
 
-                data, sr = sf.read("_tmp_tts.wav", dtype="float32")
-                sd.play(data, sr)
-                sd.wait()
-            finally:
-                self._is_speaking.clear()
+    def _speak_worker(self, text: str, lang: str) -> None:
+        """백그라운드에서 TTS 생성 및 재생. 재생 끝나면 _is_speaking 해제."""
+        try:
+            engine = self._get_engine(lang)
+            # MeloTTS: hps.data.spk2id는 HParams 객체(중첩 dict가 HParams로 로드됨). .get() 대신 getattr 사용.
+            hps = getattr(engine, "hps", None)
+            data = getattr(hps, "data", None) if hps else None
+            spk2id = getattr(data, "spk2id", None) if data else None
+            voice = self.VOICE_BY_LANG.get(lang, "KR")
+            if spk2id is not None:
+                speaker_id = getattr(spk2id, voice, None)
+                if speaker_id is None:
+                    speaker_id = next(iter(spk2id.values()), 0)
+            else:
+                speaker_id = 0
+            engine.tts_to_file(text=text, speaker_id=speaker_id, output_path="_tmp_tts.wav")
+            import sounddevice as sd  # type: ignore
+            import soundfile as sf  # type: ignore
+
+            wav_data, sr = sf.read("_tmp_tts.wav", dtype="float32")
+            sd.play(wav_data, sr)
+            sd.wait()
+        finally:
+            self._is_speaking.clear()
 
     def speak_error(self, text: str) -> None:
         self.speak(f"오류: {text}", lang="ko")
