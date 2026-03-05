@@ -3,6 +3,12 @@ from __future__ import annotations
 import asyncio
 import signal
 from enum import Enum
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# 프로젝트 루트(backend 상위)의 .env 로드
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from audio_handler import AudioHandler
 from live_session_manager import LiveSessionManager

@@ -1,5 +1,6 @@
-# LTS Bot backend
+# LTS Bot backend (Python 3.9+)
 wheel>=0.38.0
+python-dotenv>=1.0.0
 websockets>=12.0
 google-generativeai>=0.8.0
 pyaudio>=0.2.14
