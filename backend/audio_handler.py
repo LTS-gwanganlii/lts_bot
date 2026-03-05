@@ -187,9 +187,7 @@ class AudioHandler:
             rms = _frame_rms(frame)
             if rms >= self.gate_threshold:
                 if len(voiced_frames) == 0:
-                    logger.info("게이트 임계 통과 (RMS=%.0f, 임계=%.0f), copy 재생", rms, self.gate_threshold)
-                    if self.on_gemini_invoked:
-                        self.on_gemini_invoked()
+                    logger.info("게이트 임계 통과 (RMS=%.0f, 임계=%.0f)", rms, self.gate_threshold)
                 voiced_frames.append(frame)
                 silence_sec = 0.0
                 voiced_duration_sec += frame_duration_sec
@@ -202,6 +200,9 @@ class AudioHandler:
                 if silence_sec >= self.silence_threshold:
                     if utterance_started:
                         audio_bytes = b"".join(voiced_frames)
+                        logger.info("오디오 수집완료 (%.2fs), copy 재생 후 STT 전송", len(audio_bytes) / (self.sample_rate * 2))
+                        if self.on_gemini_invoked:
+                            self.on_gemini_invoked()
                         text = await self.session_manager.transcribe(audio_bytes)
                         voiced_frames = []
                         silence_sec = 0.0
