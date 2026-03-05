@@ -22,6 +22,44 @@ AUDIO_PCM_MIME = "audio/pcm;rate=16000"
 MIN_AUDIO_BYTES = 3200
 
 
+def _raw_dump(obj, max_len: int = 500) -> str:
+    """디버깅용: 객체를 로그 가능한 문자열로 (바이너리/과도한 길이 제한)."""
+    if obj is None:
+        return "None"
+    if isinstance(obj, (str, bytes)):
+        s = obj.decode("utf-8", errors="replace") if isinstance(obj, bytes) else obj
+        return repr(s[:max_len] + ("..." if len(s) > max_len else ""))
+    if hasattr(obj, "model_dump"):
+        try:
+            d = obj.model_dump(mode="json")
+            return _raw_dump(d, max_len)
+        except Exception:
+            pass
+    if hasattr(obj, "__dict__"):
+        try:
+            d = {k: getattr(obj, k, None) for k in dir(obj) if not k.startswith("_")}
+            out = []
+            for k, v in d.items():
+                if isinstance(v, (bytes, bytearray)):
+                    out.append(f"{k}=<bytes len={len(v)}>")
+                elif isinstance(v, str) and len(v) > 200:
+                    out.append(f"{k}={repr(v[:200])}...")
+                else:
+                    out.append(f"{k}={repr(v)[:150]}")
+            return "{" + ", ".join(out[:20]) + (" ..." if len(out) > 20 else "") + "}"
+        except Exception as e:
+            return f"<dump err: {e}>"
+    if isinstance(obj, dict):
+        out = []
+        for k, v in list(obj.items())[:15]:
+            if isinstance(v, (bytes, bytearray)):
+                out.append(f"{k}=<bytes len={len(v)}>")
+            else:
+                out.append(f"{k}={repr(v)[:100]}")
+        return "{" + ", ".join(out) + (" ..." if len(obj) > 15 else "") + "}"
+    return repr(obj)[:max_len]
+
+
 def _extract_text(val) -> Optional[str]:
     """객체/str/bytes/dict에서 텍스트 문자열 추출."""
     if val is None:
@@ -86,17 +124,42 @@ class LiveSessionManager:
 
         # 현재 턴에서 누적된 전사 텍스트
         turn_texts: list[str] = []
+        _msg_count = 0
 
         def _flush_turn():
             result = " ".join(turn_texts).strip()
             turn_texts.clear()
+            logger.info("[Live RAW] _flush_turn → transcript_queue.put_nowait(%r)", result[:100] + ("..." if len(result) > 100 else ""))
             self._transcript_queue.put_nowait(result)
             logger.info("전사 턴 완료: %s", result[:80] + ("..." if len(result) > 80 else "") if result else "(없음)")
 
+        logger.info("[Live RAW] receive_loop 시작, session.receive() 대기 중...")
         try:
             async for msg in session.receive():
                 if self._closed:
                     break
+                _msg_count += 1
+                # RAW: 수신된 메시지 항상 로그 (타입 + 구조 요약)
+                logger.info(
+                    "[Live RAW] msg #%d 수신 | type=%s | dir=%s",
+                    _msg_count,
+                    type(msg).__name__,
+                    [x for x in dir(msg) if not x.startswith("_")],
+                )
+                logger.info("[Live RAW] msg dump: %s", _raw_dump(msg))
+
+                sc = getattr(msg, "server_content", None)
+                if sc is not None:
+                    logger.info(
+                        "[Live RAW] server_content 있음 | sc.type=%s | sc.dump: %s",
+                        type(sc).__name__,
+                        _raw_dump(sc),
+                    )
+                    logger.info(
+                        "[Live RAW] server_content turn_complete=%s, turnComplete=%s",
+                        getattr(sc, "turn_complete", "<없음>"),
+                        getattr(sc, "turnComplete", "<없음>"),
+                    )
 
                 # ── Session resumption ──────────────────────────────────────
                 su = getattr(msg, "session_resumption_update", None)
@@ -141,7 +204,9 @@ class LiveSessionManager:
                                     turn_texts.append(t)
 
                     # turn_complete / turnComplete → 큐에 넣기 (텍스트 없어도 빈 문자열로 신호)
-                    if getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False):
+                    turn_done = getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False)
+                    if turn_done:
+                        logger.info("[Live RAW] turn_complete=True 감지 → _flush_turn() 호출")
                         _flush_turn()
                         continue
 
@@ -251,20 +316,25 @@ class LiveSessionManager:
             session = self._session
         if session is None:
             return ""
-        logger.info("Live API 오디오 전송 중 (%d bytes)...", len(audio_bytes))
+        logger.info("[Live RAW] 오디오 전송 시작: %d bytes, mime=%s", len(audio_bytes), AUDIO_PCM_MIME)
         try:
             # send_realtime_input: 한 번에 하나의 인자만 허용
+            logger.info("[Live RAW] send_realtime_input(audio=blob) 호출 중...")
             await session.send_realtime_input(audio=blob)
+            logger.info("[Live RAW] send_realtime_input(audio=blob) 완료")
             try:
                 await session.send_realtime_input(audio_stream_end=True)
-            except (TypeError, ValueError):
-                pass  # audio_stream_end 미지원 SDK
-            logger.info("Live API 전송 완료, turn_complete 대기 중...")
-        except AttributeError:
+                logger.info("[Live RAW] send_realtime_input(audio_stream_end=True) 완료")
+            except (TypeError, ValueError) as e:
+                logger.info("[Live RAW] audio_stream_end 미지원 또는 오류 (무시): %s", e)
+            logger.info("[Live RAW] 전송 끝. transcript_queue.get() 대기 (timeout=30s)...")
+        except AttributeError as e:
+            logger.info("[Live RAW] send_realtime_input 없음, send() 폴백: %s", e)
             try:
                 await session.send(input=blob, end_of_turn=True)
-            except Exception as e:
-                self._on_error(f"Live 오디오 전송 실패: {e}")
+                logger.info("[Live RAW] session.send(end_of_turn=True) 완료")
+            except Exception as send_err:
+                self._on_error(f"Live 오디오 전송 실패: {send_err}")
                 return ""
         except Exception as e:
             self._on_error(f"Live 오디오 전송 실패: {e}")
@@ -279,9 +349,11 @@ class LiveSessionManager:
             return ""
         try:
             text = await asyncio.wait_for(self._transcript_queue.get(), timeout=30.0)
+            logger.info("[Live RAW] transcript_queue.get() 수신: len=%d", len(text))
             logger.info("전사 결과: %s", text[:80] + "..." if len(text) > 80 else text)
             return text
         except asyncio.TimeoutError:
+            logger.warning("[Live RAW] transcript_queue.get() 타임아웃(30s) — 서버에서 turn_complete 미수신 또는 메시지 없음")
             self._on_error("Live 전사 응답 시간 초과 (turn_complete 미수신)")
             return ""
         except Exception as e:
