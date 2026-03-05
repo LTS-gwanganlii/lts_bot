@@ -240,36 +240,21 @@ class LiveSessionManager:
                     # ── 전사 텍스트 수집 ────────────────────────────────────────
                     sc = getattr(msg, "server_content", None)
                     if sc:
-                        # input_audio_transcription / input_transcription: 사용자 음성 전사 (STT 핵심)
-                        # 문서: https://ai.google.dev/gemini-api/docs/live
-                        for attr in ("input_audio_transcription", "inputAudioTranscription", "input_transcription"):
-                            t = _extract_text(getattr(sc, attr, None))
-                            if t:
-                                logger.debug("input_audio_transcription: %s", t)
-                                turn_texts.append(t)
-                                _put_transcript(t)
-                                break
-
-                        # output_transcription: 모델 음성 전사 (텍스트가 없을 때 보조)
-                        if not turn_texts:
-                            for attr in ("output_transcription", "outputTranscription"):
+                        # 사용자 발화 전사: server_content.input_transcription.text (문서)
+                        # 부분 전사가 turn_complete 전에 스트리밍으로 올 수 있음 → 받는 즉시 큐에 넣음.
+                        t = None
+                        it = getattr(sc, "input_transcription", None) or getattr(sc, "inputTranscription", None)
+                        if it is not None:
+                            t = getattr(it, "text", None) or _extract_text(it)
+                        if not t:
+                            for attr in ("input_audio_transcription", "inputAudioTranscription"):
                                 t = _extract_text(getattr(sc, attr, None))
                                 if t:
-                                    logger.debug("output_transcription: %s", t)
-                                    turn_texts.append(t)
-                                    _put_transcript(t)
                                     break
-
-                        # model_turn.parts[].text (TEXT 모달리티 응답 혹은 일부 SDK 버전)
-                        if not turn_texts:
-                            model_turn = getattr(sc, "model_turn", None)
-                            if model_turn:
-                                for part in getattr(model_turn, "parts", None) or []:
-                                    t = getattr(part, "text", None)
-                                    if t:
-                                        logger.debug("model_turn.part.text: %s", t)
-                                        turn_texts.append(t)
-                                        _put_transcript(t)
+                        if t:
+                            logger.debug("[Live] input_transcription: %s", t[:60] + ("..." if len(t) > 60 else ""))
+                            turn_texts.append(t)
+                            _put_transcript(t)
 
                         # turn_complete 시 스트림 종료(이 for 끝남). 다음 턴은 바깥 while에서 receive() 재호출.
                         turn_done = getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False)
@@ -317,12 +302,11 @@ class LiveSessionManager:
             if self._session is not None:
                 return True
             client = self._get_client()
-            # native-audio 모델은 TEXT 미지원(→ 1007). AUDIO만 사용.
-            # input_audio_transcription: 사용자 음성 전사 요청.
-            # 서버 VAD 끄고 클라이언트가 activity_start/activity_end로 턴 경계 명시.
+            # STT만 필요: setup에 input_audio_transcription 필수(문서). response는 TEXT만(한 번에 하나만).
+            # output_audio_transcription 제거 → 모델 TTS/전사 안 받음.
+            # 서버 VAD 끄고 activity_start/activity_end로 턴 경계 명시.
             config_dict: dict = {
-                "response_modalities": ["AUDIO"],
-                "output_audio_transcription": {},
+                "response_modalities": ["TEXT"],
                 "input_audio_transcription": {},
                 "realtime_input_config": {
                     "automatic_activity_detection": {"disabled": True},
