@@ -90,7 +90,8 @@ class AudioHandler:
         self.silence_threshold = silence_threshold
         self.gate_threshold = gate_threshold if gate_threshold is not None else self._env_float("AUDIO_GATE_THRESHOLD", 500.0)
         self.gate_min_duration_sec = gate_min_duration_sec if gate_min_duration_sec is not None else self._env_float("AUDIO_GATE_MIN_DURATION_SEC", 0.4)
-        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=120)
+        # STT 대기 중에도 캡처 스레드는 계속 put → 큐가 작으면 다음 발화 앞부분이 짤림. 500프레임 ≈ 15초분.
+        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -201,11 +202,18 @@ class AudioHandler:
                     if utterance_started:
                         audio_bytes = b"".join(voiced_frames)
                         dur_sec = len(audio_bytes) / (self.sample_rate * 2)
-                        logger.info("오디오 수집완료 (%.2fs), copy 재생 후 STT 전송", dur_sec)
+                        queue_depth = self._audio_queue.qsize()
+                        logger.info(
+                            "오디오 수집완료 (%.2fs, %d bytes) 큐깊이=%d, copy 재생 후 STT 전송",
+                            dur_sec, len(audio_bytes), queue_depth,
+                        )
                         if self.on_gemini_invoked:
                             self.on_gemini_invoked()
                         logger.info("AI(STT) 호출 시작 (%.0f bytes)", len(audio_bytes))
                         text = await self.session_manager.transcribe(audio_bytes)
+                        after_q = self._audio_queue.qsize()
+                        if after_q >= 400:
+                            logger.warning("STT 반환 후 큐 깊이=%d (거의 가득 — 다음 발화 앞부분 짤림 가능)", after_q)
                         if text:
                             logger.info("AI(STT) 응답 수신: %s", text[:80] + ("..." if len(text) > 80 else ""))
                         else:

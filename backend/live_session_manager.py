@@ -20,6 +20,8 @@ LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 AUDIO_PCM_MIME = "audio/pcm;rate=16000"
 # 16 kHz, 16-bit mono: 32000 bytes/sec. 최소 100ms 미만은 non-audio 오류 유발 가능.
 MIN_AUDIO_BYTES = 3200
+# 문서 권장: 20~40ms 청크로 전송 시 레이턴시/인식 안정성 유리. 20ms = 640 bytes.
+CHUNK_BYTES = 640
 
 
 def _raw_dump(obj, max_len: int = 500) -> str:
@@ -316,23 +318,44 @@ class LiveSessionManager:
             session = self._session
         if session is None:
             return ""
-        logger.info("[Live RAW] 오디오 전송 시작: %d bytes, mime=%s", len(audio_bytes), AUDIO_PCM_MIME)
+        import time as _time
+        send_start = _time.perf_counter()
+        total_bytes = len(audio_bytes)
+        logger.info("[Live RAW] 오디오 전송 시작: %d bytes (%.2fs), mime=%s", total_bytes, total_bytes / 32000.0, AUDIO_PCM_MIME)
+
         try:
-            # send_realtime_input: 한 번에 하나의 인자만 허용
-            logger.info("[Live RAW] send_realtime_input(audio=blob) 호출 중...")
-            await session.send_realtime_input(audio=blob)
-            logger.info("[Live RAW] send_realtime_input(audio=blob) 완료")
+            # 문서 권장: 20~40ms 청크로 스트리밍. 한 번에 한 blob만 보내면 잘리거나 서버 처리 이슈 가능.
+            chunks = []
+            for i in range(0, total_bytes, CHUNK_BYTES):
+                chunk = audio_bytes[i : i + CHUNK_BYTES]
+                if chunk:
+                    chunks.append(chunk)
+            if not chunks:
+                chunks = [audio_bytes]
+            logger.info("[Live RAW] 청크 %d개로 전송 (청크당 최대 %d bytes ≈ 20ms)", len(chunks), CHUNK_BYTES)
+
+            for idx, chunk in enumerate(chunks):
+                chunk_blob = types.Blob(data=chunk, mime_type=AUDIO_PCM_MIME)
+                await session.send_realtime_input(audio=chunk_blob)
+                if idx == 0:
+                    first_chunk_at = _time.perf_counter() - send_start
+                    logger.info("[Live RAW] 첫 청크 전송 완료 (경과 %.3fs)", first_chunk_at)
+
+            last_chunk_at = _time.perf_counter() - send_start
+            logger.info("[Live RAW] 마지막 청크 전송 완료 (총 경과 %.3fs)", last_chunk_at)
+
             try:
                 await session.send_realtime_input(audio_stream_end=True)
-                logger.info("[Live RAW] send_realtime_input(audio_stream_end=True) 완료")
+                stream_end_at = _time.perf_counter() - send_start
+                logger.info("[Live RAW] audio_stream_end 전송 완료 (총 경과 %.3fs)", stream_end_at)
             except (TypeError, ValueError) as e:
                 logger.info("[Live RAW] audio_stream_end 미지원 또는 오류 (무시): %s", e)
             logger.info("[Live RAW] 전송 끝. transcript_queue.get() 대기 (timeout=30s)...")
         except AttributeError as e:
-            logger.info("[Live RAW] send_realtime_input 없음, send() 폴백: %s", e)
+            logger.info("[Live RAW] send_realtime_input 없음, send() 폴백 (한 번에 전송): %s", e)
             try:
                 await session.send(input=blob, end_of_turn=True)
-                logger.info("[Live RAW] session.send(end_of_turn=True) 완료")
+                logger.info("[Live RAW] session.send(end_of_turn=True) 완료 (경과 %.3fs)", _time.perf_counter() - send_start)
             except Exception as send_err:
                 self._on_error(f"Live 오디오 전송 실패: {send_err}")
                 return ""
