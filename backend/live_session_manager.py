@@ -212,12 +212,12 @@ class LiveSessionManager:
             return ""
         logger.info("Live API 오디오 전송 중 (%d bytes)...", len(audio_bytes))
         try:
-            # send_realtime_input 인자: audio, audio_stream_end(스트림 끝 신호). end_of_turn은 미지원.
-            await session.send_realtime_input(audio=blob, audio_stream_end=True)
-            logger.info("Live API 전송 완료, 전사 대기 중...")
-        except TypeError:
-            # audio_stream_end 미지원 구버전 SDK
+            # send_realtime_input: 한 번에 하나의 인자만 허용. 오디오 → 스트림 끝 순서로 별도 호출.
             await session.send_realtime_input(audio=blob)
+            try:
+                await session.send_realtime_input(audio_stream_end=True)
+            except (TypeError, ValueError):
+                pass  # audio_stream_end 단독 호출 미지원 시 무시
             logger.info("Live API 전송 완료, 전사 대기 중...")
         except AttributeError:
             try:
