@@ -55,9 +55,14 @@ class TTSHandler:
             self._is_speaking.set()
             try:
                 engine = self._get_engine(lang)
-                speaker = self.VOICE_BY_LANG.get(lang, "KR")
-                # MeloTTS API can vary by version; this follows common synthesize call style.
-                engine.tts_to_file(text=text, speaker=speaker, output_path="_tmp_tts.wav")
+                # MeloTTS: speaker_id는 hps.data.spk2id에서 조회 (문자열 키 → 정수 ID)
+                spk2id = getattr(getattr(engine, "hps", None), "data", None) and getattr(engine.hps.data, "spk2id", None)
+                if spk2id:
+                    voice = self.VOICE_BY_LANG.get(lang, "KR")
+                    speaker_id = spk2id.get(voice, next(iter(spk2id.values())))
+                else:
+                    speaker_id = 0
+                engine.tts_to_file(text=text, speaker_id=speaker_id, output_path="_tmp_tts.wav")
                 # simple playback using sounddevice + soundfile
                 import sounddevice as sd  # type: ignore
                 import soundfile as sf  # type: ignore
