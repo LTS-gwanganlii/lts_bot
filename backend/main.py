@@ -5,7 +5,9 @@ import signal
 from enum import Enum
 
 from audio_handler import AudioHandler
+from live_session_manager import LiveSessionManager
 from llm_agent import LLMAgent
+from sound_player import play_sound
 from tts_handler import TTSHandler
 from websocket_server import WebSocketBridge
 from window_manager import WindowManager
@@ -19,7 +21,13 @@ class AssistantMode(str, Enum):
 class VoiceAssistantApp:
     def __init__(self) -> None:
         self.tts = TTSHandler()
-        self.audio = AudioHandler(on_error=self._on_audio_error, is_output_locked=self.tts.is_output_locked)
+        self.live_session = LiveSessionManager(on_error=self._on_audio_error)
+        self.audio = AudioHandler(
+            on_error=self._on_audio_error,
+            is_output_locked=self.tts.is_output_locked,
+            session_manager=self.live_session,
+            on_gemini_invoked=lambda: play_sound("copy.mp3"),
+        )
         self.llm = LLMAgent()
         try:
             self.windows = WindowManager()
@@ -33,6 +41,7 @@ class VoiceAssistantApp:
         self._running = True
 
     def _on_audio_error(self, text: str) -> None:
+        play_sound("error.mp3")
         self.tts.speak_error(text)
 
     async def _run_loop(self) -> None:
@@ -42,7 +51,7 @@ class VoiceAssistantApp:
 
         while self._running:
             try:
-                result = self.audio.get_utterance_transcript(
+                result = await self.audio.get_utterance_transcript_async(
                     translation_mode=self.mode == AssistantMode.TRANSLATION_MODE
                 )
                 if result is None:
@@ -64,15 +73,15 @@ class VoiceAssistantApp:
                     self.tts.speak(translated, lang=self.translation_target_lang)
                     continue
 
-                if not result.is_wake_command:
-                    continue
-
-                action = self.llm.plan_action(result.wake_payload)
+                # 게이트 통과한 발화는 모두 명령으로 처리 (OK 홍걸 웨이크 게이트 없음)
+                action = self.llm.plan_action(result.text)
                 await self._execute_action(action)
             except Exception as exc:
+                play_sound("error.mp3")
                 self.tts.speak_error(str(exc))
 
         self.audio.stop()
+        await self.live_session.close()
         await self.ws_bridge.stop()
 
     async def _execute_action(self, action: dict) -> None:

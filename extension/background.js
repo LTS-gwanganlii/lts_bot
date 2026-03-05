@@ -1,6 +1,10 @@
 const WS_URL = 'ws://localhost:8765';
+const RECONNECT_DELAY_MS = 1500;
+const PERIODIC_CHECK_MS = 20000;  // 백엔드 재기동 등에 대비한 주기적 연결 확인
+
 let ws = null;
 let reconnectTimer = null;
+let periodicTimer = null;
 let mutex = Promise.resolve();
 
 function withMutex(task) {
@@ -10,7 +14,14 @@ function withMutex(task) {
   return mutex;
 }
 
+function isConnected() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
+
 function connectWebSocket() {
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+    return;
+  }
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
@@ -27,11 +38,12 @@ function connectWebSocket() {
   };
 
   ws.onclose = () => {
+    ws = null;
     scheduleReconnect();
   };
 
   ws.onerror = () => {
-    ws.close();
+    if (ws) ws.close();
   };
 }
 
@@ -40,7 +52,16 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connectWebSocket();
-  }, 1500);
+  }, RECONNECT_DELAY_MS);
+}
+
+function startPeriodicReconnect() {
+  if (periodicTimer) return;
+  periodicTimer = setInterval(() => {
+    if (!isConnected()) {
+      connectWebSocket();
+    }
+  }, PERIODIC_CHECK_MS);
 }
 
 async function getYoutubeTabs() {
@@ -78,3 +99,4 @@ async function handleCommand(cmd) {
 }
 
 connectWebSocket();
+startPeriodicReconnect();

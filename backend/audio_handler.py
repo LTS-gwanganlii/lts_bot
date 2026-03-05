@@ -1,11 +1,25 @@
+"""Microphone capture + level/length gate + Gemini Live STT.
+
+- PyAudio capture; no webrtcvad/whisper.
+- Level gate: only buffer frames with RMS >= threshold.
+- Min length gate: only treat as utterance when gated duration >= min_duration_sec; else discard.
+- Utterance end: silence (e.g. 1.0s) after gated segment; then send buffer to LiveSessionManager.
+- Half-duplex via is_output_locked callback.
+"""
+
 from __future__ import annotations
 
+import asyncio
+import math
+import os
 import queue
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
+
+from live_session_manager import LiveSessionManager
 
 
 @dataclass
@@ -17,16 +31,28 @@ class TranscriptResult:
     translation_stop: bool = False
 
 
+def _frame_rms(frame: bytes) -> float:
+    """RMS of 16-bit little-endian PCM mono."""
+    n = len(frame) // 2
+    if n == 0:
+        return 0.0
+    total = 0.0
+    for i in range(n):
+        sample = int.from_bytes(frame[i * 2 : i * 2 + 2], "little", signed=True)
+        total += sample * sample
+    return math.sqrt(total / n)
+
+
 class AudioHandler:
-    """Microphone streaming + VAD + whisper STT pipeline.
+    """Microphone streaming + level/length gate + Gemini Live STT.
 
     - Uses PyAudio for capture.
-    - Uses webrtcvad with explicit 1.0 second silence threshold.
-    - Uses whisper-cpp-python bindings for transcription.
-    - Supports half-duplex lock by checking `is_output_locked` callback.
+    - Level gate: frames with RMS >= gate_threshold go into utterance buffer.
+    - Min length: only send when gated segment duration >= gate_min_duration_sec; else discard.
+    - Silence threshold (e.g. 1.0s) ends utterance and triggers STT via LiveSessionManager.
+    - Half-duplex: when is_output_locked() is true, discard capture and flush buffer.
     """
 
-    WAKE_PATTERN = re.compile(r"\b(?:ok\s*홍걸|오케이\s*홍걸)\b", re.IGNORECASE)
     START_TRANSLATION_PATTERN = re.compile(
         r"(?:ok\s*홍걸|오케이\s*홍걸)\s*,?\s*(영어|러시아어|중국어)\s*번역\s*시작",
         re.IGNORECASE,
@@ -43,37 +69,44 @@ class AudioHandler:
         self,
         on_error: Callable[[str], None],
         is_output_locked: Callable[[], bool],
+        session_manager: LiveSessionManager,
+        on_gemini_invoked: Optional[Callable[[], None]] = None,
         sample_rate: int = 16000,
         frame_ms: int = 30,
-        vad_mode: int = 2,
         silence_threshold: float = 1.0,
+        gate_threshold: Optional[float] = None,
+        gate_min_duration_sec: Optional[float] = None,
     ) -> None:
         self.on_error = on_error
         self.is_output_locked = is_output_locked
+        self.session_manager = session_manager
+        self.on_gemini_invoked = on_gemini_invoked
         self.sample_rate = sample_rate
         self.frame_ms = frame_ms
         self.frame_size = int(sample_rate * frame_ms / 1000)
         self.silence_threshold = silence_threshold
+        self.gate_threshold = gate_threshold if gate_threshold is not None else self._env_float("AUDIO_GATE_THRESHOLD", 500.0)
+        self.gate_min_duration_sec = gate_min_duration_sec if gate_min_duration_sec is not None else self._env_float("AUDIO_GATE_MIN_DURATION_SEC", 0.4)
         self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=120)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
         try:
             import pyaudio  # type: ignore
-            import webrtcvad  # type: ignore
         except Exception as exc:
             raise RuntimeError(f"오디오 의존성 로드 실패: {exc}") from exc
-
         self._pyaudio_mod = pyaudio
-        self._vad = webrtcvad.Vad(vad_mode)
         self._pa = self._pyaudio_mod.PyAudio()
 
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        v = os.environ.get(name)
+        if v is None:
+            return default
         try:
-            from whisper_cpp_python import Whisper  # type: ignore
-
-            self._stt = Whisper.from_pretrained("ggml-base.bin")
-        except Exception as exc:
-            raise RuntimeError(f"Whisper 모델 로드 실패: {exc}") from exc
+            return float(v)
+        except ValueError:
+            return default
 
     def start(self) -> None:
         self._running = True
@@ -103,11 +136,9 @@ class AudioHandler:
             try:
                 frame = stream.read(self.frame_size, exception_on_overflow=False)
                 if self.is_output_locked():
-                    # Half-duplex: during TTS playback mic input is discarded.
                     continue
                 self._audio_queue.put_nowait(frame)
             except queue.Full:
-                # drop oldest behavior by discarding silently
                 _ = self._audio_queue.get_nowait()
             except Exception as exc:
                 self.on_error(f"마이크 스트림 오류: {exc}")
@@ -116,54 +147,70 @@ class AudioHandler:
         stream.stop_stream()
         stream.close()
 
-    def get_utterance_transcript(self, translation_mode: bool) -> Optional[TranscriptResult]:
-        """Block until one utterance finalized by VAD silence>=1.0s then STT."""
+    async def get_utterance_transcript_async(self, translation_mode: bool) -> Optional[TranscriptResult]:
+        """Wait for one utterance (level+length gate passed, then silence), then STT via LiveSessionManager."""
         voiced_frames: list[bytes] = []
         silence_sec = 0.0
+        utterance_started = False  # True once gated duration >= gate_min_duration_sec
+        frame_duration_sec = self.frame_ms / 1000.0
+        voiced_duration_sec = 0.0
 
         while self._running:
             if self.is_output_locked():
-                # flush queue entirely while output is speaking
+                voiced_frames.clear()
+                silence_sec = 0.0
+                utterance_started = False
+                voiced_duration_sec = 0.0
                 while not self._audio_queue.empty():
                     try:
                         self._audio_queue.get_nowait()
                     except queue.Empty:
                         break
-                time.sleep(0.03)
+                await asyncio.sleep(0.03)
                 continue
 
             try:
-                frame = self._audio_queue.get(timeout=0.2)
+                frame = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self._audio_queue.get(timeout=0.2),
+                )
             except queue.Empty:
+                await asyncio.sleep(0.02)
+                continue
+            except Exception:
+                await asyncio.sleep(0.02)
                 continue
 
-            is_speech = self._vad.is_speech(frame, self.sample_rate)
-            if is_speech:
+            rms = _frame_rms(frame)
+            if rms >= self.gate_threshold:
                 voiced_frames.append(frame)
                 silence_sec = 0.0
+                voiced_duration_sec += frame_duration_sec
+                if voiced_duration_sec >= self.gate_min_duration_sec:
+                    utterance_started = True
                 continue
 
             if voiced_frames:
-                silence_sec += self.frame_ms / 1000.0
+                silence_sec += frame_duration_sec
                 if silence_sec >= self.silence_threshold:
-                    text = self._transcribe(voiced_frames)
-                    voiced_frames = []
-                    silence_sec = 0.0
-                    if not text:
-                        return None
-                    return self._parse_text(text, translation_mode)
+                    if utterance_started:
+                        audio_bytes = b"".join(voiced_frames)
+                        if self.on_gemini_invoked:
+                            self.on_gemini_invoked()
+                        text = await self.session_manager.transcribe(audio_bytes)
+                        voiced_frames = []
+                        silence_sec = 0.0
+                        utterance_started = False
+                        voiced_duration_sec = 0.0
+                        if not text:
+                            return None
+                        return self._parse_text(text, translation_mode)
+                    else:
+                        voiced_frames.clear()
+                        silence_sec = 0.0
+                        voiced_duration_sec = 0.0
 
         return None
-
-    def _transcribe(self, frames: list[bytes]) -> str:
-        try:
-            audio_bytes = b"".join(frames)
-            result = self._stt.transcribe(audio_bytes, sample_rate=self.sample_rate)
-            text = (result.get("text") or "").strip()
-            return text
-        except Exception as exc:
-            self.on_error(f"음성 인식 실패: {exc}")
-            return ""
 
     def _parse_text(self, text: str, translation_mode: bool) -> TranscriptResult:
         text = text.strip()
@@ -184,9 +231,5 @@ class AudioHandler:
         if translation_mode:
             return TranscriptResult(text=text, is_wake_command=True, wake_payload=text)
 
-        wake_match = self.WAKE_PATTERN.search(text)
-        if wake_match:
-            payload = text[wake_match.end() :].lstrip(" ,")
-            return TranscriptResult(text=text, is_wake_command=True, wake_payload=payload)
-
-        return TranscriptResult(text=text, is_wake_command=False, wake_payload="")
+        # 웨이크 게이트 없음: 게이트 통과한 발화는 모두 명령으로 전달
+        return TranscriptResult(text=text, is_wake_command=True, wake_payload=text)

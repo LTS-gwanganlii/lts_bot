@@ -2,6 +2,15 @@
 
 이 프로젝트는 **Python 음성 비서 백엔드**와 **크롬 익스텐션(YouTube 제어)**로 구성되어 있습니다.
 
+---
+
+**이용 제한**
+
+- **상업적 사용 불가**: 이 프로젝트는 비상업적·개인 용도로만 사용할 수 있습니다.
+- **라이선스 보유 기업만 사용 가능**: 상업·영리 목적으로 사용하려면 해당 소프트웨어 및 API(예: Gemini, MeloTTS 등)의 이용약관 및 라이선스를 충족하는 기업·단체만 사용할 수 있습니다. 사용 전 각 의존 소프트웨어의 라이선스와 이용 조건을 확인하세요.
+
+---
+
 ## 1) 크롬 익스텐션 설치 방법
 
 1. 크롬 주소창에 `chrome://extensions` 입력
@@ -25,10 +34,14 @@ python -m pip install --upgrade pip
 프로젝트 코드에서 사용하는 주요 패키지 예시:
 
 ```bash
-pip install websockets google-generativeai pyaudio webrtcvad sounddevice soundfile pywin32
+pip install -r requirements.txt
+# 또는
+pip install websockets google-generativeai google-genai pyaudio sounddevice soundfile pywin32
 ```
 
-추가로 사용 환경에 따라 Whisper/MeloTTS 관련 패키지 및 모델이 필요할 수 있습니다.
+- **STT**: Gemini Developer API (AI Studio) Live API 사용. `google-genai` 패키지 필요.
+- **TTS**: MeloTTS 사용 환경에 따라 해당 패키지 및 모델이 필요할 수 있습니다.
+- 블루투스 PTT 키는 앱에서 감지하지 않음. 대신 **레벨·길이 게이트**로 발화 판단(일정 이상 음성이 일정 시간 이상일 때만 전송). 선택 환경 변수: `AUDIO_GATE_THRESHOLD`, `AUDIO_GATE_MIN_DURATION_SEC`.
 
 ## 3) 실행 (빌드/테스트 서버)
 
@@ -52,15 +65,15 @@ python -m py_compile backend/*.py
 
 ## 4) 동작 흐름 요약
 
-1. 마이크 음성 입력 → STT 처리
-2. 호출어(`ok 홍걸`) + 명령 분석
+1. 마이크 음성 입력 → 레벨·길이 게이트 통과 시에만 버퍼 적재 → 무음 종료 시 Gemini Live API로 STT
+2. 전사 텍스트를 명령으로 분석 (호출어 없음)
 3. Python 백엔드가 웹소켓으로 명령 브로드캐스트
 4. 크롬 익스텐션이 YouTube 탭에 play/pause/seek/search 명령 전달
 
 ## 5) 자주 발생하는 문제
 
 - **익스텐션이 반응이 없음**: `backend/main.py`가 실행 중인지, 포트 `8765`가 열려 있는지 확인
-- **음성 기능 오류**: 오디오 장치 권한, PyAudio 설치 상태 확인
+- **음성 기능 오류**: 오디오 장치 권한, PyAudio 설치 상태 확인. STT는 Gemini Live API 사용으로 `GEMINI_API_KEY` 필요.
 - **LLM 관련 오류**: `GEMINI_API_KEY` 환경변수 설정 확인
 
 ```bash
