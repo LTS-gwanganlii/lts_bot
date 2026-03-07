@@ -7,6 +7,8 @@ pyaudio>=0.2.14
 sounddevice>=0.4.6
 soundfile>=0.12.1
 google-genai>=1.0.0
+webrtcvad>=2.0.10
+
 
 # TTS: PyPI melotts 패키지는 Windows 등에서 빌드 오류가 있음. 아래 별도 설치.
 # pip install git+https://github.com/myshell-ai/MeloTTS.git

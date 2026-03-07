@@ -19,22 +19,18 @@ def play_sound(filename: str) -> None:
     if not path.is_file():
         return
     try:
-        if sys.platform == "darwin":
+        if sys.platform == "win32":
+            import winsound
+            # 백그라운드에서 비동기로 파일 위치의 재생 (플래그: SND_FILENAME | SND_ASYNC)
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        elif sys.platform == "darwin":
             subprocess.Popen(
                 ["afplay", str(path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        elif sys.platform == "win32":
-            # start /b: 기본 앱으로 재생하되 호출이 즉시 반환되도록. CREATE_NO_WINDOW으로 콘솔 미표시.
-            subprocess.Popen(
-                ["cmd", "/c", "start", "/b", "", str(path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-            )
         else:
-            # Linux 등: paplay, aplay, mpv 등 있을 수 있음
+            # Linux 등: paplay, aplay, mpv 등
             for cmd in ["paplay", "aplay", "mpv", "ffplay"]:
                 if os.path.exists(f"/usr/bin/{cmd}") or os.path.exists(f"/usr/local/bin/{cmd}"):
                     subprocess.Popen(

@@ -25,26 +25,6 @@ from live_session_manager import LiveSessionManager
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class TranscriptResult:
-    text: str
-    is_wake_command: bool
-    wake_payload: str
-    translation_start_lang: Optional[str] = None
-    translation_stop: bool = False
-
-
-def _frame_rms(frame: bytes) -> float:
-    """RMS of 16-bit little-endian PCM mono."""
-    n = len(frame) // 2
-    if n == 0:
-        return 0.0
-    total = 0.0
-    for i in range(n):
-        sample = int.from_bytes(frame[i * 2 : i * 2 + 2], "little", signed=True)
-        total += sample * sample
-    return math.sqrt(total / n)
-
 
 class AudioHandler:
     """Microphone streaming + level/length gate + Gemini Live STT.
@@ -56,17 +36,6 @@ class AudioHandler:
     - Half-duplex: when is_output_locked() is true, discard capture and flush buffer.
     """
 
-    START_TRANSLATION_PATTERN = re.compile(
-        r"(?:ok\s*홍걸|오케이\s*홍걸)\s*,?\s*(영어|러시아어|중국어)\s*번역\s*시작",
-        re.IGNORECASE,
-    )
-    STOP_TRANSLATION_PATTERN = re.compile(r"번역\s*중지", re.IGNORECASE)
-
-    LANG_MAP = {
-        "영어": "en",
-        "러시아어": "ru",
-        "중국어": "zh",
-    }
 
     def __init__(
         self,
@@ -98,10 +67,13 @@ class AudioHandler:
 
         try:
             import pyaudio  # type: ignore
+            import webrtcvad # type: ignore
         except Exception as exc:
             raise RuntimeError(f"오디오 의존성 로드 실패: {exc}") from exc
+        
         self._pyaudio_mod = pyaudio
         self._pa = self._pyaudio_mod.PyAudio()
+        self.vad = webrtcvad.Vad(3)  # Aggressiveness: 3 (가장 강력하게 소음 차단)
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
@@ -154,7 +126,7 @@ class AudioHandler:
         stream.stop_stream()
         stream.close()
 
-    async def get_utterance_transcript_async(self, translation_mode: bool) -> Optional[TranscriptResult]:
+    async def get_utterance_transcript_async(self) -> Optional[str]:
         """Wait for one utterance (level+length gate passed, then silence), then STT via LiveSessionManager."""
         voiced_frames: list[bytes] = []
         silence_sec = 0.0
@@ -188,10 +160,14 @@ class AudioHandler:
                 await asyncio.sleep(0.02)
                 continue
 
-            rms = _frame_rms(frame)
-            if rms >= self.gate_threshold:
+            try:
+                is_speech = self.vad.is_speech(frame, self.sample_rate)
+            except Exception as e:
+                is_speech = False
+
+            if is_speech:
                 if len(voiced_frames) == 0:
-                    logger.info("게이트 임계 통과 (RMS=%.0f, 임계=%.0f)", rms, self.gate_threshold)
+                    logger.info("게이트 임계 통과 (WebRTC VAD 감지)")
                 voiced_frames.append(frame)
                 silence_sec = 0.0
                 voiced_duration_sec += frame_duration_sec
@@ -231,32 +207,10 @@ class AudioHandler:
                         voiced_duration_sec = 0.0
                         if not text:
                             return None
-                        return self._parse_text(text, translation_mode)
+                        return text.strip()
                     else:
                         voiced_frames.clear()
                         silence_sec = 0.0
                         voiced_duration_sec = 0.0
 
         return None
-
-    def _parse_text(self, text: str, translation_mode: bool) -> TranscriptResult:
-        text = text.strip()
-
-        if self.STOP_TRANSLATION_PATTERN.search(text):
-            return TranscriptResult(text=text, is_wake_command=False, wake_payload="", translation_stop=True)
-
-        start_match = self.START_TRANSLATION_PATTERN.search(text)
-        if start_match:
-            lang_kr = start_match.group(1)
-            return TranscriptResult(
-                text=text,
-                is_wake_command=True,
-                wake_payload=text,
-                translation_start_lang=self.LANG_MAP.get(lang_kr),
-            )
-
-        if translation_mode:
-            return TranscriptResult(text=text, is_wake_command=True, wake_payload=text)
-
-        # 웨이크 게이트 없음: 게이트 통과한 발화는 모두 명령으로 전달
-        return TranscriptResult(text=text, is_wake_command=True, wake_payload=text)

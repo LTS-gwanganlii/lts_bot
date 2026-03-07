@@ -16,12 +16,62 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 # Model and config (Live API native audio model)
-LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+LIVE_MODEL = "gemini-2.0-flash"
 AUDIO_PCM_MIME = "audio/pcm;rate=16000"
 # 16 kHz, 16-bit mono: 32000 bytes/sec. 최소 100ms 미만은 non-audio 오류 유발 가능.
 MIN_AUDIO_BYTES = 3200
 # 문서 권장: 20~40ms 청크로 전송 시 레이턴시/인식 안정성 유리. 20ms = 640 bytes.
 CHUNK_BYTES = 640
+
+LIVE_TOOLS = [
+    {
+        "function_declarations": [
+            {
+                "name": "move_edge_window",
+                "description": "창 지정된 방향(left, right)으로 이동",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {"target": {"type": "STRING", "enum": ["left", "right"]}},
+                    "required": ["target"],
+                },
+            },
+            {
+                "name": "youtube_control",
+                "description": "유튜브 웹 페이지 제어",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "action": {
+                            "type": "STRING",
+                            "enum": ["search_and_play", "pause", "play", "seek"]
+                        },
+                        "query": {"type": "STRING", "description": "검색어(search_and_play일 때)"},
+                        "seconds": {"type": "NUMBER", "description": "이동할 초(seek일 때)"},
+                    },
+                    "required": ["action"],
+                },
+            },
+            {
+                "name": "translate_speech",
+                "description": "사용자 발화를 지정된 언어로 번역해서 출력합니다.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "text": {"type": "STRING", "description": "번역된 텍스트 결과"},
+                        "target_lang": {"type": "STRING", "description": "번역된 언어 코드 (ko, en, zh, ru 중 하나)"}
+                    },
+                    "required": ["text", "target_lang"]
+                }
+            }
+        ]
+    }
+]
+
+SYSTEM_INSTRUCTION = {
+    "parts": [
+        {"text": "당신은 사용자의 음성 명령을 받아 관련 도구를 호출하는 AI 비서입니다. 대답 대신 반드시 적합한 도구를 호출해야 합니다. 불필요한 텍스트 대답을 자제하세요."}
+    ]
+}
 
 
 def _msg_summary(msg) -> str:
@@ -237,26 +287,52 @@ class LiveSessionManager:
                         else:
                             self._resumption_handle = None
 
-                    # ── 전사 텍스트 수집 ────────────────────────────────────────
+                    # ── 도구 호출 및 텍스트 응답 수집 ────────────────────────────────────────
+                    # 최상위 tool_call 확인 (google-genai SDK 0.5+)
+                    tc = getattr(msg, "tool_call", None)
+                    if tc:
+                        logger.info("[Live RAW] msg.tool_call 수신")
+                        import json
+                        try:
+                            # wire data에서 function_calls 추출
+                            fcalls = []
+                            for fc in getattr(tc, "function_calls", []) or []:
+                                args_dict = {}
+                                for k, v in (getattr(fc, "args", {}) or {}).items():
+                                    args_dict[k] = v
+                                fcalls.append({"name": getattr(fc, "name", ""), "args": args_dict})
+                            if fcalls:
+                                jstr = json.dumps({"type": "tool_call", "data": {"function_calls": fcalls}}, ensure_ascii=False)
+                                turn_texts.append(jstr)
+                                _put_transcript(jstr)
+                        except Exception as e:
+                            logger.error("tool_call 파싱 실패: %s", e)
+
                     sc = getattr(msg, "server_content", None)
                     if sc:
-                        # 사용자 발화 전사: server_content.input_transcription.text (문서)
-                        # 부분 전사가 turn_complete 전에 스트리밍으로 올 수 있음 → 받는 즉시 큐에 넣음.
-                        t = None
-                        it = getattr(sc, "input_transcription", None) or getattr(sc, "inputTranscription", None)
-                        if it is not None:
-                            t = getattr(it, "text", None) or _extract_text(it)
-                        if not t:
-                            for attr in ("input_audio_transcription", "inputAudioTranscription"):
-                                t = _extract_text(getattr(sc, attr, None))
-                                if t:
-                                    break
-                        if t:
-                            logger.debug("[Live] input_transcription: %s", t[:60] + ("..." if len(t) > 60 else ""))
-                            turn_texts.append(t)
-                            _put_transcript(t)
+                        # server_content 내부의 model_turn -> parts 확인 (FunctionCall 또는 Text)
+                        mt = getattr(sc, "model_turn", None)
+                        if mt:
+                            for part in getattr(mt, "parts", []) or []:
+                                fc = getattr(part, "function_call", None)
+                                if fc:
+                                    import json
+                                    try:
+                                        args_dict = {}
+                                        for k, v in (getattr(fc, "args", {}) or {}).items():
+                                            args_dict[k] = v
+                                        jstr = json.dumps({"type": "tool_call", "data": {"function_calls": [{"name": getattr(fc, "name", ""), "args": args_dict}]}}, ensure_ascii=False)
+                                        turn_texts.append(jstr)
+                                        _put_transcript(jstr)
+                                    except Exception as e:
+                                        pass
+                                else:
+                                    text_val = _extract_text(part)
+                                    if text_val:
+                                        turn_texts.append(text_val)
+                                        _put_transcript(text_val)
 
-                        # turn_complete 시 스트림 종료(이 for 끝남). 다음 턴은 바깥 while에서 receive() 재호출.
+                        # turn_complete 시 턴 종료
                         turn_done = getattr(sc, "turn_complete", False) or getattr(sc, "turnComplete", False)
                         if turn_done:
                             logger.info("[Live RAW] turn_complete=True 감지 → 턴 종료")
@@ -275,7 +351,7 @@ class LiveSessionManager:
                                 turn_texts.append(raw_text)
                                 _put_transcript(raw_text)
 
-                    # 메시지 최상위 text (일부 SDK 버전)
+                    # 메시지 최상위 text fallback
                     top_text = _extract_text(getattr(msg, "text", None))
                     if top_text and top_text not in turn_texts:
                         low = top_text.lower()
@@ -302,12 +378,11 @@ class LiveSessionManager:
             if self._session is not None:
                 return True
             client = self._get_client()
-            # STT만 필요: setup에 input_audio_transcription 필수(문서). response는 TEXT만(한 번에 하나만).
-            # output_audio_transcription 제거 → 모델 TTS/전사 안 받음.
-            # 서버 VAD 끄고 activity_start/activity_end로 턴 경계 명시.
+            # 모델 응답(tool calls 및 텍스트) 수신 필요
+            # input_audio_transcription을 제거하여 굳이 STT를 안 받도록 하거나 켜둡니다 (여기선 도구 호출 위주)
             config_dict: dict = {
-                "response_modalities": ["TEXT"],
-                "input_audio_transcription": {},
+                "tools": LIVE_TOOLS,
+                "system_instruction": SYSTEM_INSTRUCTION,
                 "realtime_input_config": {
                     "automatic_activity_detection": {"disabled": True},
                 },

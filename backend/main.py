@@ -21,16 +21,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 from audio_handler import AudioHandler
 from live_session_manager import LiveSessionManager
-from llm_agent import LLMAgent
 from sound_player import play_sound
 from tts_handler import TTSHandler
 from websocket_server import WebSocketBridge
 from window_manager import WindowManager
-
-
-class AssistantMode(str, Enum):
-    NORMAL_MODE = "NORMAL_MODE"
-    TRANSLATION_MODE = "TRANSLATION_MODE"
 
 
 class VoiceAssistantApp:
@@ -41,24 +35,22 @@ class VoiceAssistantApp:
             on_error=self._on_audio_error,
             is_output_locked=self.tts.is_output_locked,
             session_manager=self.live_session,
-            on_gemini_invoked=lambda: play_sound("copy.mp3"),
+            on_gemini_invoked=lambda: play_sound("copy.wav"),
         )
-        self.llm = LLMAgent()
+
         try:
             self.windows = WindowManager()
         except Exception as exc:
             self.windows = None
             logger.exception("창 제어 기능 비활성화: %s", exc)
-            play_sound("error.mp3")
+            play_sound("error.wav")
         self.ws_bridge = WebSocketBridge()
 
-        self.mode = AssistantMode.NORMAL_MODE
-        self.translation_target_lang = "en"
         self._running = True
 
     def _on_audio_error(self, text: str) -> None:
         logger.error("오디오/Live 오류: %s", text)
-        play_sound("error.mp3")
+        play_sound("error.wav")
 
     async def _run_loop(self) -> None:
         await self.ws_bridge.start()
@@ -67,68 +59,62 @@ class VoiceAssistantApp:
 
         while self._running:
             try:
-                result = await self.audio.get_utterance_transcript_async(
-                    translation_mode=self.mode == AssistantMode.TRANSLATION_MODE
-                )
-                if result is None:
+                result = await self.audio.get_utterance_transcript_async()
+                if not result:
                     continue
 
-                if result.translation_stop:
-                    self.mode = AssistantMode.NORMAL_MODE
-                    self.tts.speak("번역 모드를 종료합니다.", lang="ko")
-                    continue
+                import json
+                try:
+                    data = json.loads(result)
+                    if data.get("type") == "tool_call":
+                        fcalls = data.get("data", {}).get("function_calls", [])
+                        for fc in fcalls:
+                            await self._execute_tool_call(fc)
+                        continue
+                except json.JSONDecodeError:
+                    pass
 
-                if result.translation_start_lang:
-                    self.mode = AssistantMode.TRANSLATION_MODE
-                    self.translation_target_lang = result.translation_start_lang
-                    self.tts.speak("번역 모드를 시작합니다.", lang="ko")
-                    continue
-
-                if self.mode == AssistantMode.TRANSLATION_MODE:
-                    logger.info("AI(LLM) 번역 요청 시작 (target=%s)", self.translation_target_lang)
-                    translated = self.llm.translate_text(result.text, self.translation_target_lang)
-                    logger.info("AI(LLM) 번역 완료")
-                    self.tts.speak(translated, lang=self.translation_target_lang)
-                    continue
-
-                # 게이트 통과한 발화는 모두 명령으로 처리 (OK 홍걸 웨이크 게이트 없음)
-                logger.info("AI(LLM) 명령 분석 요청 시작")
-                action = self.llm.plan_action(result.text)
-                logger.info("AI(LLM) 명령 분석 완료: action=%s", action.get("action", "none"))
-                await self._execute_action(action)
+                logger.info("AI(일반 응답): %s", result)
             except Exception as exc:
                 logger.exception("런루프 예외: %s", exc)
-                play_sound("error.mp3")
+                play_sound("error.wav")
 
         self.audio.stop()
         await self.live_session.close()
         await self.ws_bridge.stop()
 
-    async def _execute_action(self, action: dict) -> None:
-        kind = action.get("action", "none")
+    async def _execute_tool_call(self, fc: dict) -> None:
+        name = fc.get("name")
+        args = fc.get("args", {})
+        logger.info("Tool Call 수신: %s(%s)", name, args)
 
-        if kind == "move_edge_window":
+        if name == "move_edge_window":
             if self.windows is None:
-                self.tts.speak("창 제어 기능이 비활성화되어 있습니다.", lang="ko")
+                logger.warning("창 제어 기능 비활성화 상태")
                 return
-            target = action.get("target", "left")
+            target = args.get("target", "left")
             msg = self.windows.move_and_fullscreen(target)
-            self.tts.speak(msg, lang="ko")
+            logger.info("창 제어 결과: %s", msg)
             return
 
-        if kind == "youtube_control":
+        if name == "youtube_control":
             payload = {
-                "action": action.get("action_name") or action.get("youtube_action") or action.get("sub_action"),
-                "query": action.get("query"),
-                "seconds": action.get("seconds"),
+                "action": args.get("action", "play"),
+                "query": args.get("query"),
+                "seconds": args.get("seconds"),
             }
-            if not payload["action"]:
-                payload["action"] = "play"
             await self.ws_bridge.broadcast(payload)
-            self.tts.speak("유튜브 명령을 전달했습니다.", lang="ko")
+            logger.info("유튜브 제어 시그널 브로드캐스트 완료")
             return
 
-        self.tts.speak(action.get("text", "명령을 이해하지 못했습니다."), lang="ko")
+        if name == "translate_speech":
+            text = args.get("text")
+            lang = args.get("target_lang", "ko")
+            if text:
+                logger.info("번역 텍스트 수신, TTS 재생 시작 (lang=%s): %s", lang, text)
+                self.tts.speak(text, lang=lang)
+            return
+
 
     def stop(self) -> None:
         self._running = False
