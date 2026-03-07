@@ -381,6 +381,7 @@ class LiveSessionManager:
             # 모델 응답(tool calls 및 텍스트) 수신 필요
             # input_audio_transcription을 제거하여 굳이 STT를 안 받도록 하거나 켜둡니다 (여기선 도구 호출 위주)
             config_dict: dict = {
+                "response_modalities": ["TEXT"],
                 "tools": LIVE_TOOLS,
                 "system_instruction": SYSTEM_INSTRUCTION,
                 "realtime_input_config": {
